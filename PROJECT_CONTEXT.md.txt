@@ -1,0 +1,347 @@
+# Fuel Mileage Calculator — Project Context
+
+## 1. Purpose
+
+A personal fuel mileage / fuel cost tracking REST API built with Java and Spring Boot.
+It lets a user register vehicles, log fuel fill-ups, compute mileage (km/L, MPG, L/100km),
+estimate trip costs, and view summary/monthly reports. It is deliberately designed to be
+**scalable and extensible** so new features (new fuel types, units, reports, alerts, multi-user)
+can be added without modifying existing code.
+
+Current status: **compiles successfully (BUILD SUCCESS) and runs locally** with an in-memory H2 DB.
+Docker/PostgreSQL files have been written but not yet tested (see sections 12 and 17).
+
+## 2. Tech Stack (exact versions matter)
+
+| Component | Version / Choice |
+|-----------|------------------|
+| Java | 17 |
+| Spring Boot | **4.1.1** (uses Spring Framework 7, Jackson 3) |
+| Build | Maven (wrapper `mvnw.cmd` / `mvnw`) |
+| Persistence | Spring Data JPA (Hibernate), Flyway migrations |
+| Databases | H2 in-memory (dev profile), PostgreSQL (prod profile) |
+| API docs | springdoc-openapi **3.1.1** (`springdoc-openapi-starter-webmvc-ui`) |
+| Mapping | MapStruct 1.6.2 + `lombok-mapstruct-binding` 0.2.0 |
+| Boilerplate | Lombok |
+| Cache | Spring Cache + Caffeine |
+| Observability | Spring Boot Actuator |
+| Validation | Jakarta Bean Validation (`spring-boot-starter-validation`) |
+| Containers (optional) | Docker Desktop, docker compose, postgres:16-alpine |
+
+### Spring Boot 4 specifics (important when giving advice)
+- Starter names changed in Boot 4: `spring-boot-starter-webmvc` (not `-web`),
+  `spring-boot-starter-flyway`, `spring-boot-h2console`, and per-feature test starters
+  (`spring-boot-starter-webmvc-test`, `spring-boot-starter-data-jpa-test`).
+- Jackson 3 (`tools.jackson.*`) is the default; the project does not use Jackson directly.
+- springdoc 2.x is NOT compatible with Boot 4 — must use 3.1.x.
+- `@MockBean` is replaced by `@MockitoBean` in tests (not yet used in this project).
+- `pom.xml` uses a plain `<project>` tag without xmlns attributes (intentional, see section 10).
+
+## 3. Project Layout
+
+Base package: `com.example.fuelcalc`
+Source root: `src/main/java`
+Organisation: **package-by-feature** (each feature is self-contained → could be split into
+microservices later).
+
+```
+com.example.fuelcalc
+├── FuelCalcApplication.java          @SpringBootApplication @EnableCaching @ConfigurationPropertiesScan
+├── common/
+│   ├── config/
+│   │   ├── FuelCalcProperties.java   record, @ConfigurationProperties(prefix="fuelcalc")
+│   │   ├── JpaConfig.java            @EnableJpaAuditing
+│   │   ├── OpenApiConfig.java        OpenAPI info bean
+│   │   ├── CacheConfig.java          Caffeine CacheManager; cache name constant REPORTS = "reports"
+│   │   └── AsyncConfig.java          @EnableAsync
+│   ├── exception/
+│   │   ├── ResourceNotFoundException.java   → 404
+│   │   ├── BusinessRuleException.java       → 422
+│   │   ├── ApiError.java                    record(timestamp, status, error, message, details)
+│   │   └── GlobalExceptionHandler.java      @RestControllerAdvice
+│   └── model/
+│       └── BaseEntity.java           @MappedSuperclass: id, createdAt, updatedAt, @Version
+├── calculator/                        (stateless calculations, no DB)
+│   ├── api/CalculatorController.java  /api/v1/calculator
+│   ├── api/dto/ MileageRequest, MileageResponse(@Builder record), TripCostRequest, TripCostResponse
+│   ├── domain/CalculationService.java (interface)
+│   ├── domain/unit/DistanceUnit.java  enum KM, MILE (toKm/fromKm)
+│   ├── domain/unit/VolumeUnit.java    enum LITRE, US_GALLON, UK_GALLON, KWH (toLitre/fromLitre)
+│   ├── domain/strategy/MileageStrategy.java          interface supports(FuelType), calculate(km, fuel)
+│   ├── domain/strategy/CombustionMileageStrategy.java PETROL, DIESEL, CNG, HYBRID
+│   ├── domain/strategy/ElectricMileageStrategy.java   ELECTRIC (km per kWh)
+│   ├── domain/strategy/MileageStrategyResolver.java   picks strategy from injected List<MileageStrategy>
+│   └── service/DefaultCalculationService.java
+├── vehicle/
+│   ├── api/VehicleController.java     /api/v1/vehicles (CRUD, paginated list)
+│   ├── api/VehicleMapper.java         MapStruct: toEntity, toResponse, update(@MappingTarget)
+│   ├── api/dto/ VehicleRequest, VehicleResponse
+│   ├── domain/FuelType.java           enum PETROL, DIESEL, CNG, ELECTRIC, HYBRID
+│   ├── domain/Vehicle.java            entity: name, fuelType, tankCapacity
+│   ├── domain/VehicleService.java     interface
+│   ├── repository/VehicleRepository.java
+│   ├── service/DefaultVehicleService.java
+│   └── service/ServiceReminderListener.java  @Async @EventListener on FuelEntryLoggedEvent (placeholder)
+├── fuellog/
+│   ├── api/FuelEntryController.java   /api/v1/vehicles/{vehicleId}/entries
+│   ├── api/FuelEntryMapper.java       MapStruct
+│   ├── api/dto/ FuelEntryRequest, FuelEntryResponse
+│   ├── domain/FuelEntry.java          entity; computeDerivedValues() sets distance, mileage, totalCost
+│   ├── domain/FuelEntryService.java   interface
+│   ├── domain/FuelEntryLoggedEvent.java record(vehicleId, entryId, mileage, odometerEnd)
+│   ├── repository/FuelEntryRepository.java  findByVehicleId(Pageable), findByVehicleIdAndEntryDateBetween, monthlyAggregates (JPQL EXTRACT)
+│   └── service/DefaultFuelEntryService.java publishes FuelEntryLoggedEvent; evicts "reports" cache
+└── report/
+    ├── api/ReportController.java      /api/v1/vehicles/{vehicleId}/reports/{type}
+    ├── domain/ReportType.java         enum SUMMARY, MONTHLY
+    ├── domain/ReportGenerator.java    interface type(), generate(vehicleId, from, to)
+    ├── service/ReportService.java     EnumMap of generators; @Cacheable("reports")
+    ├── service/SummaryReportGenerator.java
+    └── service/MonthlyReportGenerator.java
+
+src/main/resources/
+├── application.yml        shared config, active profile = dev
+├── application-dev.yml    H2 in-memory, H2 console on /h2-console, show-sql
+├── application-prod.yml   PostgreSQL via env vars DB_URL, DB_USER, DB_PASSWORD
+└── db/migration/V1__init_schema.sql
+
+src/test/java/com/example/fuelcalc/
+├── FuelCalcApplicationTests.java
+└── calculator/domain/strategy/CombustionMileageStrategyTest.java
+
+Project root (non-Java):
+.dockerignore  .env (git-ignored)  .env.example  .gitignore  .mvn/  Dockerfile
+docker-compose.yml  mvnw  mvnw.cmd  pom.xml  PROJECT_CONTEXT.md
+```
+
+## 4. Design Patterns & Extension Points
+
+| Need | How to add | Existing code changes |
+|------|-----------|-----------------------|
+| New fuel type | Add enum value to `FuelType` + a `@Component` implementing `MileageStrategy` | None |
+| New unit | Add constant to `DistanceUnit` / `VolumeUnit` | None |
+| New report | Add `ReportType` value + `@Component` implementing `ReportGenerator` | None |
+| React to fill-ups (alerts, analytics) | Add `@EventListener` for `FuelEntryLoggedEvent` | None |
+| Schema change | Add `V2__*.sql` under `db/migration` (never edit V1) | None |
+| Multi-user | Add `User` entity, Spring Security, `ownerId` on `Vehicle` | Repository filters |
+
+Key conventions:
+- Controllers are thin; business logic in `service/` behind interfaces in `domain/`.
+- DTOs are Java `record`s; entities never leave the service layer.
+- All services use constructor injection via Lombok `@RequiredArgsConstructor`.
+- Entities extend `BaseEntity` and use plain `@Getter @Setter @NoArgsConstructor` (NO `@Builder`
+  on entities — it breaks MapStruct with inherited fields).
+- Monetary/decimal rounding uses `BigDecimal.setScale(props.roundingScale(), HALF_UP)`.
+- Cache: single Caffeine cache named `"reports"` (10 min TTL); evicted with `allEntries = true`
+  on any fuel entry write or vehicle delete.
+- `spring.jpa.hibernate.ddl-auto=none` — Flyway owns the schema.
+- `spring.jpa.open-in-view=false`.
+
+## 5. Database Schema (V1__init_schema.sql)
+
+```sql
+vehicle(id IDENTITY PK, name VARCHAR(100), fuel_type VARCHAR(20), tank_capacity DOUBLE PRECISION,
+        created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, version BIGINT)
+
+fuel_entry(id IDENTITY PK, vehicle_id FK→vehicle ON DELETE CASCADE, entry_date DATE,
+           odometer_start, odometer_end, fuel_quantity, price_per_unit,
+           distance, mileage, total_cost  (all DOUBLE PRECISION),
+           created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, version BIGINT)
+
+INDEX idx_fuel_entry_vehicle_date ON fuel_entry(vehicle_id, entry_date DESC)
+```
+
+## 6. Configuration (application.yml)
+
+```yaml
+fuelcalc:
+  default-currency: INR
+  default-distance-unit: KM
+  default-volume-unit: LITRE
+  rounding-scale: 2
+```
+Bound to `FuelCalcProperties(String defaultCurrency, DistanceUnit defaultDistanceUnit,
+VolumeUnit defaultVolumeUnit, int roundingScale)`.
+
+Profiles: `dev` (default, H2) and `prod` (PostgreSQL, env vars).
+
+## 7. REST API (all under /api/v1)
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/calculator/mileage` | body: distance, distanceUnit, fuelQuantity, volumeUnit, fuelType, pricePerUnit? → mileageKmpl, mileageMpgUs, mileageL100km, totalCost, costPerKm, currency |
+| POST | `/calculator/trip-cost` | body: distance, distanceUnit, mileageKmpl, pricePerLitre → fuelNeededLitres, estimatedCost, currency |
+| POST | `/vehicles` | 201; body: name, fuelType, tankCapacity? |
+| GET | `/vehicles` | paginated (`page`, `size`, `sort`) |
+| GET/PUT/DELETE | `/vehicles/{id}` | DELETE → 204 |
+| POST | `/vehicles/{vehicleId}/entries` | 201; body: entryDate, odometerStart, odometerEnd, fuelQuantity, pricePerUnit |
+| GET | `/vehicles/{vehicleId}/entries` | paginated, default sort entryDate DESC |
+| DELETE | `/vehicles/{vehicleId}/entries/{entryId}` | 204 |
+| GET | `/vehicles/{vehicleId}/reports/SUMMARY?from=&to=` | totals, avg/best/worst mileage, cost per km |
+| GET | `/vehicles/{vehicleId}/reports/MONTHLY?from=&to=` | per-month distance, fuel, spent, avg mileage |
+
+Error format (all errors):
+```json
+{ "timestamp": "...", "status": 404, "error": "Not Found", "message": "...", "details": [] }
+```
+404 = ResourceNotFoundException, 422 = BusinessRuleException, 400 = validation / malformed JSON.
+
+Other URLs: `/swagger-ui.html`, `/v3/api-docs`, `/actuator/health`, `/h2-console`
+(JDBC `jdbc:h2:mem:fueldb`, user `sa`, blank password).
+
+## 8. Core Formulas
+
+- mileage (km/L) = distanceKm / fuelLitres
+- MPG (US) = (km/L ÷ 1.609344) × 3.785411784
+- L/100km = 100 / (km/L)
+- trip cost = (distanceKm / mileageKmpl) × pricePerLitre
+- cost per km = totalCost / distanceKm
+
+## 9. How to Build & Run
+
+```
+.\mvnw.cmd clean compile        # Windows
+.\mvnw.cmd spring-boot:run
+./mvnw clean compile            # macOS/Linux
+```
+App starts on port 8080. Data is in-memory in dev profile (resets on restart).
+
+Smoke test (Swagger UI → [http://localhost:8080/swagger-ui.html):](http://localhost:8080/swagger-ui.html):)
+1. POST /api/v1/vehicles  {"name":"My Car","fuelType":"PETROL","tankCapacity":40}
+2. POST /api/v1/vehicles/1/entries  {"entryDate":"2026-10-07","odometerStart":12000,"odometerEnd":12450,"fuelQuantity":32.5,"pricePerUnit":104.5}
+3. GET  /api/v1/vehicles/1/reports/SUMMARY
+4. POST /api/v1/calculator/mileage  {"distance":450,"distanceUnit":"KM","fuelQuantity":32.5,"volumeUnit":"LITRE","fuelType":"PETROL","pricePerUnit":104.5}
+
+## 10. Known Gotchas Encountered (so they are not repeated)
+
+1. Copy-pasting from a chat UI into VS Code converted URLs in `pom.xml` into Markdown links
+   (`[http://...](...)`), breaking XML. Fixed by using a plain `<project>` tag without xmlns.
+   Always use the code-block copy button or "paste as plain text" (Ctrl+Shift+V).
+2. VS Code's Java extension auto-inserted wrong `package main.java.com...` lines in new files
+   before the Maven project was imported. All package lines must be `com.example.fuelcalc...`.
+   Fix: "Java: Clean Java Language Server Workspace". When creating a file: select all, delete,
+   then paste the full content (which already includes the package line).
+3. A "duplicate class" compile error silently disables Lombok, producing dozens of misleading
+   "cannot find symbol" errors for getters/builders/log. Always fix duplicate/package errors first.
+4. `@Builder` must NOT be placed on JPA entities that extend `BaseEntity` (MapStruct mapping breaks).
+5. springdoc version must be 3.1.x for Spring Boot 4.1.x.
+6. Project folder from Initializr unzips as a nested folder; open the INNER folder (the one
+   directly containing pom.xml) in VS Code.
+
+## 11. Possible Next Steps (not yet implemented)
+
+- Verify Docker/PostgreSQL setup end-to-end (files exist, see section 12; not yet run)
+- Switch dev profile to H2 file-based for zero-setup persistence (see section 17)
+- Service reminder logic in `ServiceReminderListener` (needs `nextServiceKm` on Vehicle → V2 migration)
+- Yearly / cost-trend reports (new `ReportGenerator`)
+- Spring Security + JWT and multi-user ownership
+- Thymeleaf or React front-end consuming the API
+- Postman collection / `.http` file with sample requests
+- Integration tests with `@SpringBootTest` + `MockMvc` (Boot 4: use `@MockitoBean`)
+- `README.md` for GitHub visitors (human-focused; this file is AI/developer context)
+
+## 12. Docker & PostgreSQL (prod profile)
+
+Files at project root: `Dockerfile` (multi-stage, builds the jar inside Docker),
+`.dockerignore`, `docker-compose.yml`, `.env.example` (committed), `.env` (NOT committed).
+
+`docker-compose.yml` defines:
+- `db`  — postgres:16-alpine, port 5432, named volume `fuelcalc-pgdata`, healthcheck via pg_isready
+- `app` — built from Dockerfile, compose profile `full` (only starts with `--profile full`),
+          env: SPRING_PROFILES_ACTIVE=prod, DB_URL=jdbc:postgresql://db:5432/${POSTGRES_DB}, DB_USER, DB_PASSWORD
+
+`.env` variables: POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD (Compose reads it automatically).
+`.env.example` holds placeholder values; copy it to `.env` and set a real password.
+
+Dockerfile notes: runs `sed -i 's/\r$//' mvnw && chmod +x mvnw` to fix Windows line endings;
+runtime image is eclipse-temurin:17-jre-alpine running as non-root user `spring`.
+
+Mode A (DB in Docker, app from IDE):
+```
+docker compose up -d
+$env:DB_URL="jdbc:postgresql://localhost:5432/fueldb"; $env:DB_USER="fuel"; $env:DB_PASSWORD="<from .env>"
+.\mvnw.cmd spring-boot:run "-Dspring-boot.run.profiles=prod"
+```
+Mode B (all in Docker): `docker compose --profile full up --build`
+Stop: `docker compose down`   Wipe data: `docker compose down -v`
+psql: `docker exec -it fuelcalc-db psql -U fuel -d fueldb`  (then `\dt`, `SELECT * FROM vehicle;`, `\q`)
+
+Flyway runs V1__init_schema.sql automatically on first connection. `flyway-database-postgresql`
+dependency is required for Flyway + PostgreSQL (already in pom.xml).
+
+## 13. Secrets Policy
+
+- NO real credentials in the repository. `application-prod.yml` uses `${DB_URL}`, `${DB_USER}`, `${DB_PASSWORD}`.
+- Dev profile (H2, user `sa`, blank password) needs no secrets.
+- Real values live in: environment variables, OR `.env` (Docker Compose), OR
+  `src/main/resources/application-local.yml` (run with profiles `prod,local`).
+- `.gitignore` must contain: `target/`, `.vscode/`, `.idea/`, `*.iml`, `*.log`, `.env`,
+  `application-local.yml`, `data/`.
+- Before every first push: `git status` must not list target/, .env, application-local.yml, or data/.
+- Scan for accidental secrets:
+  `Get-ChildItem -Recurse -Include *.yml,*.properties,*.java,*.sql src | Select-String -Pattern 'password|secret|apikey|token'`
+
+## 14. Setting Up on a New Device
+
+1. Install JDK 17+ (verify `java -version`), Git, VS Code, and optionally Docker Desktop.
+2. VS Code extensions: "Extension Pack for Java" (Microsoft) and "Spring Boot Extension Pack" (VMware).
+3. `git clone [https://github.com/<user>/fuel-mileage-calculator.git`%20then%20open%20THAT%20folder%20in%20VS%20Code](https://github.com/<user>/fuel-mileage-calculator.git`%20then%20open%20THAT%20folder%20in%20VS%20Code)
+   (the folder that directly contains pom.xml).
+4. Wait for "Java: Ready" in the status bar. If VS Code shows wrong-package warnings
+   (`main.java.com...`), run "Java: Clean Java Language Server Workspace" from the Command Palette.
+5. Dev run (no DB setup): `.\mvnw.cmd spring-boot:run`  → [http://localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html)
+6. Persistent DB: copy `.env.example` to `.env`, set a password, follow section 12 Mode A
+   — or use the simpler H2 file-based option in section 17.
+
+## 15. Git Workflow
+
+Initial publish: `git init` → `git add .` → `git commit -m "..."` → `git branch -M main`
+→ `git remote add origin <url>` → `git push -u origin main`
+(or VS Code: Source Control panel → "Publish to GitHub").
+First-time identity: `git config --global user.name "Name"` / `git config --global user.email "email"`.
+Daily: `git add .` → `git commit -m "..."` → `git push`.  Other device: `git pull` before working.
+Alternative one-off share: `.\mvnw.cmd clean` then zip the project folder (excludes target/).
+
+## 16. Files at Project Root (expected)
+
+```
+.dockerignore  .env (ignored)  .env.example  .gitignore  .mvn/  Dockerfile  docker-compose.yml
+mvnw  mvnw.cmd  pom.xml  PROJECT_CONTEXT.md  src/
+```
+
+## 17. Data Storage Options & Current Status
+
+The project supports three storage modes. Only ONE is active at a time, controlled by the
+Spring profile and the `spring.datasource.url` value.
+
+| Mode | Where configured | Data persists? | Extra software | Status |
+|------|------------------|----------------|----------------|--------|
+| H2 in-memory | `application-dev.yml` → `jdbc:h2:mem:fueldb` | No (resets on restart) | None | **ACTIVE (current default)** |
+| H2 file-based | `application-dev.yml` → `jdbc:h2:file:./data/fueldb` | Yes (local `data/` folder) | None | Not applied yet |
+| PostgreSQL via Docker | `application-prod.yml` + `docker-compose.yml` + `.env` | Yes (Docker volume) | Docker Desktop | Files ready, not yet tested |
+
+### Currently active: H2 in-memory (dev profile)
+- Start with `.\mvnw.cmd spring-boot:run` — no setup required.
+- All data is lost when the app stops. Fine for development/testing.
+
+### To switch to H2 file-based (recommended next step for personal use, zero setup)
+1. In `src/main/resources/application-dev.yml` change the datasource URL to:
+   `jdbc:h2:file:./data/fueldb;MODE=PostgreSQL;AUTO_SERVER=TRUE`
+2. Add `data/` to `.gitignore` (the DB file is machine-specific, never commit it).
+3. Restart the app. A `data/` folder appears in the project root; data survives restarts.
+4. H2 console JDBC URL becomes `jdbc:h2:file:./data/fueldb` (user `sa`, blank password).
+5. Update the Status column above to mark this mode ACTIVE.
+
+### To switch to PostgreSQL via Docker (for cloud deployment or shared DB)
+- Follow section 12 (Mode A or Mode B). Requires Docker Desktop and a `.env` file.
+- Flyway creates the schema automatically on first connection.
+
+### Why Docker is optional
+Docker only replaces "install PostgreSQL manually on every device" with one command.
+For a single-user personal project, H2 file-based gives persistence with zero extra software.
+Docker/PostgreSQL becomes worthwhile for cloud deployment, shared databases, or learning Docker.
+
+### Notes
+- Flyway migrations in `db/migration` apply to ALL three modes — never edit V1, add V2+ for changes.
+- Switching between H2 and PostgreSQL does NOT migrate existing data; each store starts empty.
+- H2 runs in `MODE=PostgreSQL` so SQL behaves the same across modes.
